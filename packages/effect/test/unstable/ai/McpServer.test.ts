@@ -1,8 +1,9 @@
 import { assert, describe, it } from "@effect/vitest"
-import { assertTrue, strictEqual } from "@effect/vitest/utils"
+import { assertTrue, deepStrictEqual, strictEqual } from "@effect/vitest/utils"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Schema from "effect/Schema"
 import * as Sink from "effect/Sink"
@@ -22,7 +23,7 @@ import * as HttpRouter from "effect/unstable/http/HttpRouter"
 import { RpcSerialization } from "effect/unstable/rpc"
 import * as Rpc from "effect/unstable/rpc/Rpc"
 import * as RpcClient from "effect/unstable/rpc/RpcClient"
-import { makeServerLayer, makeWebHandler } from "./McpServer/utils.ts"
+import { makeServerLayer, makeWebHandler, MCP_ENDPOINT } from "./McpServer/utils.ts"
 
 const OptionalStringTool = Tool.make("OptionalStringTool", {
   parameters: Schema.Struct({ signature: Schema.optional(Schema.String) }),
@@ -70,6 +71,43 @@ const pingBody = {
   method: "ping",
   params: {},
   id: 0
+}
+
+const initializeBody = {
+  jsonrpc: "2.0",
+  id: 1,
+  method: "initialize",
+  params: initializePayload
+}
+
+const webRequest = (
+  handler: (request: Request) => Promise<Response>,
+  method: string,
+  options?: {
+    readonly headers?: Record<string, string> | undefined
+    readonly body?: unknown
+  }
+) =>
+  Effect.promise(() =>
+    handler(
+      new Request(MCP_ENDPOINT, {
+        method,
+        headers: {
+          accept: "application/json, text/event-stream",
+          "content-type": "application/json",
+          ...options?.headers
+        },
+        ...(options?.body === undefined ? {} : { body: JSON.stringify(options.body) })
+      })
+    )
+  )
+
+const getSessionId = (response: Response): string => {
+  const sessionId = response.headers.get("Mcp-Session-Id")
+  if (sessionId === null) {
+    throw new Error("Expected initialize to return an MCP session id")
+  }
+  return sessionId
 }
 
 const makeTestClientWith = Effect.fnUntraced(function*<A>(
@@ -361,12 +399,12 @@ describe("McpServer", () => {
 
       yield* client.initialize(initializePayload)
 
-      for (const method of ["GET", "PUT", "PATCH", "DELETE", "HEAD"] as const) {
+      for (const method of ["GET", "PUT", "PATCH", "HEAD"] as const) {
         const response = yield* HttpClientRequest.make(method)("http://localhost/mcp").pipe(
           httpClient.execute
         )
         strictEqual(response.status, 405)
-        strictEqual(response.headers["allow"], "POST")
+        strictEqual(response.headers["allow"], "POST, DELETE")
       }
 
       yield* client.ping({})
@@ -589,4 +627,124 @@ describe("McpServer", () => {
         })
       }))
   })
+
+  it.effect("terminates an initialized session exactly once", () =>
+    Effect.gen(function*() {
+      const { client, httpClient } = yield* makeTestClient
+
+      const missingSessionResponse = yield* HttpClientRequest.make("DELETE")("http://localhost/mcp").pipe(
+        httpClient.execute
+      )
+      strictEqual(missingSessionResponse.status, 400)
+
+      yield* client.initialize(initializePayload)
+
+      yield* client.ping({})
+
+      const deleteResponse = yield* HttpClientRequest.make("DELETE")("http://localhost/mcp").pipe(
+        HttpClientRequest.setHeader("Mcp-Protocol-Version", "2025-06-18"),
+        httpClient.execute
+      )
+      strictEqual(deleteResponse.status, 200)
+      strictEqual(yield* deleteResponse.text, "")
+
+      const pingResponse = yield* HttpClientRequest.post("http://localhost/mcp").pipe(
+        HttpClientRequest.bodyJsonUnsafe(pingBody),
+        httpClient.execute
+      )
+      strictEqual(pingResponse.status, 404)
+
+      const duplicateDeleteResponse = yield* HttpClientRequest.make("DELETE")("http://localhost/mcp").pipe(
+        httpClient.execute
+      )
+      strictEqual(duplicateDeleteResponse.status, 404)
+    }))
+
+  it.effect("uses a custom SessionStore for initialize and DELETE", () =>
+    Effect.gen(function*() {
+      const sessions = new Map<
+        string,
+        Parameters<McpServer.SessionStore["Service"]["set"]>[1]
+      >()
+      const setSessionIds: Array<string> = []
+      const removeSessionIds: Array<string> = []
+      const store = McpServer.SessionStore.of({
+        get: (sessionId) =>
+          Effect.sync(() => {
+            const payload = sessions.get(sessionId)
+            return payload === undefined ? Option.none() : Option.some(payload)
+          }),
+        set: (sessionId, payload) =>
+          Effect.sync(() => {
+            setSessionIds.push(sessionId)
+            sessions.set(sessionId, payload)
+          }),
+        remove: (sessionId) =>
+          Effect.sync(() => {
+            removeSessionIds.push(sessionId)
+            return sessions.delete(sessionId)
+          })
+      })
+      const webHandler = yield* makeWebHandler(
+        TestServerLayer.pipe(Layer.provide(Layer.succeed(McpServer.SessionStore, store)))
+      )
+
+      const initializeResponse = yield* webRequest(webHandler, "POST", {
+        body: initializeBody
+      })
+      const sessionId = getSessionId(initializeResponse)
+      deepStrictEqual(setSessionIds, [sessionId])
+
+      const invalidDeleteResponse = yield* webRequest(webHandler, "DELETE", {
+        headers: {
+          "Mcp-Session-Id": sessionId,
+          "Mcp-Protocol-Version": "9999-01-01"
+        }
+      })
+      strictEqual(invalidDeleteResponse.status, 400)
+      deepStrictEqual(removeSessionIds, [])
+
+      const deleteResponse = yield* webRequest(webHandler, "DELETE", {
+        headers: { "Mcp-Session-Id": sessionId }
+      })
+      strictEqual(deleteResponse.status, 200)
+      deepStrictEqual(removeSessionIds, [sessionId])
+    }))
+
+  it.effect("shares one SessionStore across independent HTTP replicas", () =>
+    Effect.gen(function*() {
+      const sharedStore = yield* McpServer.SessionStore.pipe(
+        Effect.provide(McpServer.layerSessionStoreMemory)
+      )
+      const storeLayer = Layer.succeed(McpServer.SessionStore, sharedStore)
+      const replicaA = yield* makeWebHandler(TestServerLayer.pipe(Layer.provide(storeLayer)))
+      const replicaB = yield* makeWebHandler(TestServerLayer.pipe(Layer.provide(storeLayer)))
+
+      const initializeResponse = yield* webRequest(replicaA, "POST", {
+        body: initializeBody
+      })
+      const sessionId = getSessionId(initializeResponse)
+      const headers = { "Mcp-Session-Id": sessionId }
+
+      const pingOnB = yield* webRequest(replicaB, "POST", {
+        headers,
+        body: pingBody
+      })
+      strictEqual(pingOnB.status, 200)
+
+      const deleteOnB = yield* webRequest(replicaB, "DELETE", { headers })
+      strictEqual(deleteOnB.status, 200)
+
+      const pingOnAAfterDelete = yield* webRequest(replicaA, "POST", {
+        headers,
+        body: pingBody
+      })
+      strictEqual(pingOnAAfterDelete.status, 404)
+
+      const pingOnBAfterDelete = yield* webRequest(replicaB, "POST", {
+        headers,
+        body: pingBody
+      })
+      strictEqual(pingOnBAfterDelete.status, 404)
+    }))
 })

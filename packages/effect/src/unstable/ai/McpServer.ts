@@ -338,13 +338,93 @@ export class McpServer extends Context.Service<McpServer, {
 const MCP_SESSION_ID_HEADER = "mcp-session-id"
 const MCP_PROTOCOL_VERSION_HEADER = "mcp-protocol-version"
 
+/**
+ * Service that stores initialized MCP HTTP sessions.
+ *
+ * **When to use**
+ *
+ * Use when you need to share MCP sessions across server replicas or persist
+ * them outside the server process.
+ *
+ * **Details**
+ *
+ * The store maps Streamable HTTP session ids to the client's `initialize`
+ * payload; the negotiated protocol adapter is re-derived from the payload's
+ * `protocolVersion`. `remove` succeeds with `true` when a session existed for
+ * the id and was removed, and `false` otherwise; the HTTP DELETE termination
+ * route maps these results to `200` and `404`, respectively.
+ * Supply a custom store with `Layer.provide` directly to `layer`,
+ * `layerStdio`, or `layerHttp`.
+ *
+ * **Gotchas**
+ *
+ * Sessions negotiated over non-HTTP transports such as stdio are keyed by
+ * process-local client ids and are not routed through this store.
+ *
+ * Store operations have no error channel; implementations backed by remote
+ * storage must handle backend failures internally, as unhandled defects
+ * surface as internal server errors.
+ *
+ * @see {@link layerSessionStoreMemory} for the default in-memory implementation
+ *
+ * @category server
+ * @since 4.0.0
+ */
+export class SessionStore extends Context.Service<SessionStore, {
+  readonly get: (
+    sessionId: string
+  ) => Effect.Effect<Option.Option<typeof Initialize.payloadSchema.Type>>
+  readonly set: (
+    sessionId: string,
+    payload: typeof Initialize.payloadSchema.Type
+  ) => Effect.Effect<void>
+  readonly remove: (sessionId: string) => Effect.Effect<boolean>
+}>()("effect/ai/McpServer/SessionStore") {}
+
+const makeSessionStoreMemory = (): SessionStore["Service"] => {
+  const sessions = new Map<string, typeof Initialize.payloadSchema.Type>()
+  return SessionStore.of({
+    get: (sessionId) =>
+      Effect.sync(() => {
+        const payload = sessions.get(sessionId)
+        return payload === undefined ? Option.none() : Option.some(payload)
+      }),
+    set: (sessionId, payload) =>
+      Effect.sync(() => {
+        sessions.set(sessionId, payload)
+      }),
+    remove: (sessionId) => Effect.sync(() => sessions.delete(sessionId))
+  })
+}
+
+/**
+ * Layer that stores MCP sessions in process memory.
+ *
+ * **Details**
+ *
+ * This layer provides the in-memory `SessionStore` implementation used by
+ * `layer`, `layerStdio`, and `layerHttp` when no store is provided. Provide it
+ * explicitly to share one store between multiple server layers.
+ *
+ * **Gotchas**
+ *
+ * Sessions are not shared across replicas and remain in memory until a client
+ * terminates them or the process exits.
+ *
+ * @category layers
+ * @since 4.0.0
+ */
+export const layerSessionStoreMemory: Layer.Layer<SessionStore> = Layer.sync(SessionStore)(
+  makeSessionStoreMemory
+)
+
 interface Session {
   readonly initializePayload: typeof Initialize.payloadSchema.Type
   readonly protocol: McpProtocol.ProtocolAdapter
 }
 
 interface Sessions {
-  readonly bySessionId: Map<string, Session>
+  readonly store: SessionStore["Service"]
   readonly byClientId: Map<number, Session>
 }
 
@@ -361,9 +441,13 @@ class McpProtocolState extends Context.Service<McpProtocolState, {
 const makeMcpProtocolState = Effect.fnUntraced(function*(
   protocols: Arr.NonEmptyReadonlyArray<McpProtocol.ProtocolAdapter>
 ) {
+  const sessionStore = Option.getOrElse(
+    yield* Effect.serviceOption(SessionStore),
+    makeSessionStoreMemory
+  )
   return McpProtocolState.of({
     sessions: {
-      bySessionId: new Map(),
+      store: sessionStore,
       byClientId: new Map()
     },
     protocolRegistry: yield* McpProtocolRegistry.make(protocols)
@@ -380,7 +464,9 @@ const layerMcpProtocolState = (
  *
  * **Details**
  *
- * The server performs initialization and session handling, serves registered
+ * The server performs initialization and HTTP session handling through the
+ * configured `SessionStore` (an in-memory store is used when none is
+ * provided), serves registered
  * tools, resources, and prompts, and forwards queued server notifications to
  * initialized clients.
  *
@@ -420,6 +506,7 @@ const runWithProtocolState = Effect.fnUntraced(function*(options: {
   const isHttp = Option.isSome(yield* Effect.serviceOption(HttpRouter.HttpRouter))
   const sessions = protocolState.sessions
   const clientProtocols = new Map<number, McpProtocol.ProtocolAdapter>()
+  const clientSessions = new Map<number, Session | undefined>()
   const handlers = yield* Layer.build(layerHandlers(options, {
     sessions,
     protocolRegistry
@@ -461,8 +548,8 @@ const runWithProtocolState = Effect.fnUntraced(function*(options: {
     idleTimeToLive: 10000
   })
 
-  const clientMiddleware = McpServerClientMiddleware.of((effect, { client, headers, payload, rpc }) => {
-    const session = getClientSession(sessions, client.id, headers)
+  const clientMiddleware = McpServerClientMiddleware.of((effect, { client, payload, rpc }) => {
+    const session = clientSessions.get(client.id)
     const isInitialize = rpc._tag.endsWith("/initialize")
     if (!isInitialize && !session) {
       const fiber = Fiber.getCurrent()!
@@ -528,61 +615,65 @@ const runWithProtocolState = Effect.fnUntraced(function*(options: {
                 HttpServerRequest.HttpServerRequest
               ).headers
               : Headers.fromInput(request.headers)
-            const session = getClientSession(sessions, clientId, headers)
-            const selectedProtocol = session?.protocol ??
-              (request.tag === "initialize"
-                ? protocolRegistry.select(getOfferedProtocolVersion(request.payload))
-                : protocolRegistry.protocols[0])
-            clientProtocols.set(clientId, selectedProtocol)
-            if (isHttp) {
-              const fiber = Fiber.getCurrent()!
-              const httpRequest = Context.getUnsafe(fiber.context, HttpServerRequest.HttpServerRequest)
-              if (session) {
-                appendPreResponseHandlerUnsafe(httpRequest, (_, res) =>
-                  Effect.succeed(
-                    HttpServerResponse.setHeader(
-                      res,
-                      MCP_PROTOCOL_VERSION_HEADER,
-                      session.protocol.protocolVersion
-                    )
-                  ))
-              }
-            }
-            const routedRequest = protocolRegistry.routeClientRequest(selectedProtocol, request)
-            const rpc = protocolRegistry.clientRpcs.requests.get(routedRequest.tag)
-            if (rpc && selectedProtocol.clientNotificationRpcs.requests.has(request.tag)) {
-              if (!session) {
-                if (httpRequest) {
-                  appendPreResponseHandlerUnsafe(
-                    httpRequest,
-                    () => Effect.succeed(HttpServerResponse.empty({ status: 404 }))
+            return getClientSession(sessions, protocolRegistry, clientId, headers).pipe(
+              Effect.flatMap((session) => {
+                const selectedProtocol = session?.protocol ??
+                  (request.tag === "initialize"
+                    ? protocolRegistry.select(getOfferedProtocolVersion(request.payload))
+                    : protocolRegistry.protocols[0])
+                clientProtocols.set(clientId, selectedProtocol)
+                clientSessions.set(clientId, session)
+                if (isHttp) {
+                  const fiber = Fiber.getCurrent()!
+                  const httpRequest = Context.getUnsafe(fiber.context, HttpServerRequest.HttpServerRequest)
+                  if (session) {
+                    appendPreResponseHandlerUnsafe(httpRequest, (_, res) =>
+                      Effect.succeed(
+                        HttpServerResponse.setHeader(
+                          res,
+                          MCP_PROTOCOL_VERSION_HEADER,
+                          session.protocol.protocolVersion
+                        )
+                      ))
+                  }
+                }
+                const routedRequest = protocolRegistry.routeClientRequest(selectedProtocol, request)
+                const rpc = protocolRegistry.clientRpcs.requests.get(routedRequest.tag)
+                if (rpc && selectedProtocol.clientNotificationRpcs.requests.has(request.tag)) {
+                  if (!session) {
+                    if (httpRequest) {
+                      appendPreResponseHandlerUnsafe(
+                        httpRequest,
+                        () => Effect.succeed(HttpServerResponse.empty({ status: 404 }))
+                      )
+                    }
+                    return Effect.void
+                  }
+                  const decode = selectedProtocol.payloadCodecs(rpc).decode(request.payload)
+                  return decode.pipe(
+                    Effect.flatMap((payload) => {
+                      if (request.tag === "notifications/cancelled") {
+                        return f(clientId, {
+                          _tag: "Interrupt",
+                          requestId: String((payload as any).requestId)
+                        })
+                      }
+                      const handler = handlers.mapUnsafe.get(rpc.key) as Rpc.Handler<string> | undefined
+                      return handler
+                        ? handler.handler(payload, {
+                          rpc,
+                          requestId: RpcMessage.RequestId(request.id),
+                          client: new Rpc.ServerClient(clientId),
+                          headers
+                        }) as any as Effect.Effect<void>
+                        : Effect.void
+                    }),
+                    Effect.catchCause(() => Effect.void)
                   )
                 }
-                return Effect.void
-              }
-              const decode = selectedProtocol.payloadCodecs(rpc).decode(request.payload)
-              return decode.pipe(
-                Effect.flatMap((payload) => {
-                  if (request.tag === "notifications/cancelled") {
-                    return f(clientId, {
-                      _tag: "Interrupt",
-                      requestId: String((payload as any).requestId)
-                    })
-                  }
-                  const handler = handlers.mapUnsafe.get(rpc.key) as Rpc.Handler<string> | undefined
-                  return handler
-                    ? handler.handler(payload, {
-                      rpc,
-                      requestId: RpcMessage.RequestId(request.id),
-                      client: new Rpc.ServerClient(clientId),
-                      headers
-                    }) as any as Effect.Effect<void>
-                    : Effect.void
-                }),
-                Effect.catchCause(() => Effect.void)
-              )
-            }
-            return f(clientId, routedRequest)
+                return f(clientId, routedRequest)
+              })
+            )
           }
           case "Ping":
           case "Ack":
@@ -614,6 +705,7 @@ const runWithProtocolState = Effect.fnUntraced(function*(options: {
       for (const clientId of clientProtocols.keys()) {
         if (!clientIds.has(clientId)) {
           clientProtocols.delete(clientId)
+          clientSessions.delete(clientId)
           // HTTP client IDs are request-scoped; their UUID sessions outlive them.
           if (!isHttp) {
             sessions.byClientId.delete(clientId)
@@ -792,8 +884,13 @@ export const layerStdio = (options: {
  * **Details**
  *
  * POST serves JSON-RPC and accepted notification-only requests return `202`.
- * Unsupported protocol versions return `400`; methods without MCP handlers
- * return `405`.
+ * DELETE terminates the session identified by the `Mcp-Session-Id` header
+ * through the current `SessionStore`, returning `200` when the session was
+ * removed and `404` when it did not exist; requests without a session id or
+ * with an unsupported protocol version return `400`. Unsupported protocol
+ * versions on POST return `400`; methods without MCP handlers return `405`.
+ *
+ * This layer uses an in-memory `SessionStore` by default.
  *
  * @see {@link layerStdio} for exposing the server over stdio
  * @see {@link layer} for the base MCP server layer without a transport protocol
@@ -811,13 +908,34 @@ export const layerHttp = (options: {
   const protocolState = layerMcpProtocolState(options.protocols)
   const methodNotAllowedResponse = HttpServerResponse.empty({
     status: 405,
-    headers: { allow: "POST" }
+    headers: { allow: "POST, DELETE" }
   })
   const routes = Layer.mergeAll(
     HttpRouter.add("GET", options.path, methodNotAllowedResponse),
     HttpRouter.add("PUT", options.path, methodNotAllowedResponse),
     HttpRouter.add("PATCH", options.path, methodNotAllowedResponse),
-    HttpRouter.add("DELETE", options.path, methodNotAllowedResponse)
+    HttpRouter.use(Effect.fnUntraced(function*(router) {
+      const state = yield* McpProtocolState
+      yield* router.add(
+        "DELETE",
+        options.path,
+        Effect.fnUntraced(function*(request: HttpServerRequest.HttpServerRequest) {
+          const sessionId = request.headers[MCP_SESSION_ID_HEADER]
+          if (sessionId === undefined) {
+            return HttpServerResponse.empty({ status: 400 })
+          }
+          const protocolVersion = request.headers[MCP_PROTOCOL_VERSION_HEADER]
+          if (
+            protocolVersion !== undefined &&
+            !state.protocolRegistry.protocols.some((protocol) => protocol.protocolVersion === protocolVersion)
+          ) {
+            return HttpServerResponse.empty({ status: 400 })
+          }
+          const removed = yield* state.sessions.store.remove(sessionId)
+          return HttpServerResponse.empty({ status: removed ? 200 : 404 })
+        })
+      )
+    }))
   )
   return Layer.merge(layerWithProtocolState(options), routes).pipe(
     Layer.provide(layerMcpProtocolHttp(options)),
@@ -1515,26 +1633,27 @@ const layerHandlers = (serverInfo: {
             }
             return Effect.withFiber((fiber) => {
               const httpRequest = Context.getOrUndefined(fiber.context, HttpServerRequest.HttpServerRequest)
-              const session: Session = {
-                initializePayload: params,
-                protocol: selectedProtocol
+              const result = {
+                capabilities,
+                serverInfo,
+                protocolVersion: selectedProtocol.protocolVersion
               }
               if (httpRequest) {
                 const sessionId = crypto.randomUUID()
-                options.sessions.bySessionId.set(sessionId, session)
                 appendPreResponseHandlerUnsafe(httpRequest, (_req, res) =>
                   Effect.succeed(HttpServerResponse.setHeaders(res, {
                     [MCP_SESSION_ID_HEADER]: sessionId,
                     [MCP_PROTOCOL_VERSION_HEADER]: selectedProtocol.protocolVersion
                   })))
-              } else {
-                options.sessions.byClientId.set(client.id, session)
+                return options.sessions.store.set(sessionId, params).pipe(
+                  Effect.as(result)
+                )
               }
-              return Effect.succeed({
-                capabilities,
-                serverInfo,
-                protocolVersion: selectedProtocol.protocolVersion
+              options.sessions.byClientId.set(client.id, {
+                initializePayload: params,
+                protocol: selectedProtocol
               })
+              return Effect.succeed(result)
             })
           },
           "completion/complete": (r) =>
@@ -1568,16 +1687,18 @@ const layerHandlers = (serverInfo: {
             server.getPromptResult(r).pipe(
               Effect.provideService(CurrentLogLevel, currentLogLevel)
             ),
-          "prompts/list": (_, { client, headers }) =>
-            Effect.sync(() => {
-              const initialized = getClientSession(options.sessions, client.id, headers)?.initializePayload
-              return new ListPromptsResult({ prompts: filterByClient(initialized, server.prompts, "prompt") })
-            }),
-          "resources/list": (_, { client, headers }) =>
-            Effect.sync(() => {
-              const initialized = getClientSession(options.sessions, client.id, headers)?.initializePayload
-              return new ListResourcesResult({ resources: filterByClient(initialized, server.resources, "resource") })
-            }),
+          "prompts/list": () =>
+            McpServerClient.useSync(({ initializePayload }) =>
+              new ListPromptsResult({
+                prompts: filterByClient(initializePayload, server.prompts, "prompt")
+              })
+            ),
+          "resources/list": () =>
+            McpServerClient.useSync(({ initializePayload }) =>
+              new ListResourcesResult({
+                resources: filterByClient(initializePayload, server.resources, "resource")
+              })
+            ),
           "resources/read": ({ uri }) =>
             server.findResource(uri).pipe(
               Effect.provideService(CurrentLogLevel, currentLogLevel)
@@ -1586,24 +1707,22 @@ const layerHandlers = (serverInfo: {
             InternalError.notImplemented,
           "resources/unsubscribe": () =>
             InternalError.notImplemented,
-          "resources/templates/list": (_, { client, headers }) =>
-            Effect.sync(() => {
-              const initialized = getClientSession(options.sessions, client.id, headers)?.initializePayload
-              return new ListResourceTemplatesResult({
-                resourceTemplates: filterByClient(initialized, server.resourceTemplates, "template")
+          "resources/templates/list": () =>
+            McpServerClient.useSync(({ initializePayload }) =>
+              new ListResourceTemplatesResult({
+                resourceTemplates: filterByClient(initializePayload, server.resourceTemplates, "template")
               })
-            }),
+            ),
           "tools/call": (r) =>
             server.callTool(r).pipe(
               Effect.provideService(CurrentLogLevel, currentLogLevel)
             ),
-          "tools/list": (_, { client, headers }) =>
-            Effect.sync(() => {
-              const initialized = getClientSession(options.sessions, client.id, headers)?.initializePayload
-              return new ListToolsResult({
-                tools: filterByClient(initialized, server.tools, "tool")
+          "tools/list": () =>
+            McpServerClient.useSync(({ initializePayload }) =>
+              new ListToolsResult({
+                tools: filterByClient(initializePayload, server.tools, "tool")
               })
-            }),
+            ),
 
           // Notifications
           "notifications/cancelled": (_) => Effect.void,
@@ -1701,14 +1820,21 @@ const filterByClient = <
 
 const getClientSession = (
   sessions: Sessions,
+  registry: McpProtocolRegistry.ProtocolRegistry<McpProtocol.ProtocolAdapter>,
   clientId: number,
   headers: Headers.Headers
-) => {
+): Effect.Effect<Session | undefined> => {
   const sessionId = headers[MCP_SESSION_ID_HEADER]
   if (sessionId === undefined) {
-    return sessions.byClientId.get(clientId)
+    return Effect.succeed(sessions.byClientId.get(clientId))
   }
-  return sessions.bySessionId.get(sessionId)
+  return Effect.map(sessions.store.get(sessionId), (payload) =>
+    Option.isSome(payload)
+      ? {
+        initializePayload: payload.value,
+        protocol: registry.select(payload.value.protocolVersion)
+      }
+      : undefined)
 }
 
 const getOfferedProtocolVersion = (payload: unknown): string =>
